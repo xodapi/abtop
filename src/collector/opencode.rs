@@ -68,6 +68,14 @@ impl OpenCodeCollector {
             })
             .collect();
 
+        // Resolve process cwds once per tick (per PID), not once per
+        // (session × PID). On Windows lsof is absent, so cwd lookups are
+        // pure process spawns that always fail — skip them entirely.
+        let pid_cwds: HashMap<u32, String> = opencode_pids
+            .iter()
+            .filter_map(|&pid| get_process_cwd(pid).map(|cwd| (pid, cwd)))
+            .collect();
+
         // Refresh DB rows on slow ticks only; reuse cache on fast ticks so
         // we don't fork sqlite3 every 2s.
         if shared.slow_tick {
@@ -81,8 +89,12 @@ impl OpenCodeCollector {
 
         let mut claimed_pids = HashSet::new();
         for ds in &self.cached_db_sessions {
-            let matched_pid =
-                Self::match_pid_to_session_once(&pid_commands, &ds.directory, &mut claimed_pids);
+            let matched_pid = Self::match_pid_to_session_once(
+                &pid_commands,
+                &pid_cwds,
+                &ds.directory,
+                &mut claimed_pids,
+            );
             // Drop sessions whose process isn't running. (Done sessions are
             // filtered out by MultiCollector::collect anyway, so emitting
             // a Done row here would be dead code.)
@@ -222,22 +234,33 @@ impl OpenCodeCollector {
     /// opencode process" here, because that would mark every DB row as
     /// alive whenever a single opencode is running in an unrelated dir.
     #[cfg(test)]
-    fn match_pid_to_session(pid_commands: &HashMap<u32, &str>, session_dir: &str) -> Option<u32> {
-        Self::match_pid_to_session_excluding(pid_commands, session_dir, &HashSet::new())
+    fn match_pid_to_session(
+        pid_commands: &HashMap<u32, &str>,
+        session_dir: &str,
+    ) -> Option<u32> {
+        Self::match_pid_to_session_excluding(
+            pid_commands,
+            &HashMap::new(),
+            session_dir,
+            &HashSet::new(),
+        )
     }
 
     fn match_pid_to_session_once(
         pid_commands: &HashMap<u32, &str>,
+        pid_cwds: &HashMap<u32, String>,
         session_dir: &str,
         claimed_pids: &mut HashSet<u32>,
     ) -> Option<u32> {
-        let pid = Self::match_pid_to_session_excluding(pid_commands, session_dir, claimed_pids)?;
+        let pid =
+            Self::match_pid_to_session_excluding(pid_commands, pid_cwds, session_dir, claimed_pids)?;
         claimed_pids.insert(pid);
         Some(pid)
     }
 
     fn match_pid_to_session_excluding(
         pid_commands: &HashMap<u32, &str>,
+        pid_cwds: &HashMap<u32, String>,
         session_dir: &str,
         claimed_pids: &HashSet<u32>,
     ) -> Option<u32> {
@@ -251,10 +274,8 @@ impl OpenCodeCollector {
             if claimed_pids.contains(&pid) {
                 continue;
             }
-            if let Some(cwd) = get_process_cwd(pid) {
-                if cwd == session_dir {
-                    return Some(pid);
-                }
+            if pid_cwds.get(&pid).is_some_and(|cwd| cwd == session_dir) {
+                return Some(pid);
             }
             if cmd.contains(session_dir) {
                 return Some(pid);
@@ -287,18 +308,18 @@ impl OpenCodeCollector {
 SELECT
   s.id, s.title, s.directory, s.version, s.time_created, s.time_updated,
   COALESCE(p.name, '') as project_name,
-  COUNT(m.id) as turn_count,
-  COALESCE(SUM(json_extract(m.data, '$.tokens.input')), 0) as total_input,
-  COALESCE(SUM(json_extract(m.data, '$.tokens.output')), 0) as total_output,
-  COALESCE(SUM(json_extract(m.data, '$.tokens.cache.read')), 0) as total_cache_read,
-  COALESCE(SUM(json_extract(m.data, '$.tokens.cache.write')), 0) as total_cache_write
-FROM session s
+  (SELECT COUNT(*) FROM message m
+    WHERE m.session_id = s.id
+    AND json_extract(m.data, '$.role') = 'assistant') as turn_count,
+  COALESCE(s.tokens_input, 0) as total_input,
+  COALESCE(s.tokens_output, 0) as total_output,
+  COALESCE(s.tokens_cache_read, 0) as total_cache_read,
+  COALESCE(s.tokens_cache_write, 0) as total_cache_write
+FROM (SELECT id, title, directory, version, time_created, time_updated, project_id,
+             tokens_input, tokens_output, tokens_cache_read, tokens_cache_write
+      FROM session ORDER BY time_updated DESC LIMIT {}) s
 LEFT JOIN project p ON s.project_id = p.id
-LEFT JOIN message m ON m.session_id = s.id
-  AND json_extract(m.data, '$.role') = 'assistant'
-GROUP BY s.id
-ORDER BY s.time_updated DESC
-LIMIT {};"#,
+ORDER BY s.time_updated DESC;"#,
             MAX_SESSIONS
         );
 
@@ -314,9 +335,8 @@ SELECT
     FROM message m2 WHERE m2.session_id = s.id
     AND json_extract(m2.data, '$.role') = 'assistant'
     ORDER BY m2.time_created DESC LIMIT 1), '') as provider
-FROM session s
-ORDER BY s.time_updated DESC
-LIMIT {};"#,
+FROM (SELECT id, time_updated FROM session ORDER BY time_updated DESC LIMIT {}) s
+ORDER BY s.time_updated DESC;"#,
             MAX_SESSIONS
         );
 
@@ -425,7 +445,8 @@ fn truncate_field(s: &mut String, max_bytes: usize) {
 }
 
 /// Get the current working directory of a process.
-/// Uses /proc on Linux, lsof on macOS/other Unix.
+/// Uses /proc on Linux, lsof on macOS/other Unix. Windows has no lsof,
+/// so cwd lookup returns `None` rather than spawning a failing process.
 #[cfg(target_os = "linux")]
 fn get_process_cwd(pid: u32) -> Option<String> {
     std::fs::read_link(format!("/proc/{}/cwd", pid))
@@ -433,7 +454,12 @@ fn get_process_cwd(pid: u32) -> Option<String> {
         .map(|p| p.to_string_lossy().into_owned())
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(windows, not(target_os = "linux")))]
+fn get_process_cwd(_pid: u32) -> Option<String> {
+    None
+}
+
+#[cfg(all(not(windows), not(target_os = "linux")))]
 fn get_process_cwd(pid: u32) -> Option<String> {
     // -a ANDs the selection terms; without it, lsof ORs `-p <pid>` with
     // `-d cwd` and returns cwd entries for unrelated processes too.
@@ -564,6 +590,7 @@ mod tests {
         assert_eq!(
             OpenCodeCollector::match_pid_to_session_once(
                 &pid_commands,
+                &HashMap::new(),
                 "/home/u/proj-a",
                 &mut claimed_pids,
             ),
@@ -572,6 +599,7 @@ mod tests {
         assert_eq!(
             OpenCodeCollector::match_pid_to_session_once(
                 &pid_commands,
+                &HashMap::new(),
                 "/home/u/proj-a",
                 &mut claimed_pids,
             ),

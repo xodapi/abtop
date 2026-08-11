@@ -4,9 +4,10 @@
 //! Factory Droid is a local desktop agent. It maintains `~/.factory/`:
 //! - `sessions-index.json` — every session's last-update mtime, cwd, title,
 //!   and orchestrator→worker relationships. The collector treats an index
-//!   entry as live while its mtime is recent (the index is rewritten whenever
-//!   a session makes progress), so liveness does not depend on guessing the
-//!   desktop app's process name.
+//!   entry as live while its mtime is recent, or while any of its workers is
+//!   (a mission orchestrator idles between worker turns, so a parent is kept
+//!   alive by a freshly-updated worker). Liveness does not depend on guessing
+//!   the desktop app's process name.
 //! - `sessions/**/<id>.settings.json` — per-session token usage (`tokenUsage`)
 //!   and the parent's view of each worker's usage
 //!   (`childInclusiveTokenUsageBySessionId`).
@@ -103,7 +104,6 @@ impl SessionTokenUsage {
 #[derive(Debug, Default, Clone, Copy)]
 struct LastCallUsage {
     input: u64,
-    output: u64,
     cache_read: u64,
 }
 
@@ -182,6 +182,9 @@ pub struct FactoryCollector {
     cached_child_tokens: HashMap<String, SessionTokenUsage>,
     /// Last call token usage by session id (from `lastCallTokenUsage` in settings).
     cached_last_call_usage: HashMap<String, LastCallUsage>,
+    /// Filesystem mtime of each `<sessionId>.settings.json`, used as the
+    /// freshest liveness signal (the index's `mtime` lags behind).
+    cached_settings_mtimes: HashMap<String, u64>,
     /// PIDs of detected droid processes on the last tick.
     last_droid_pids: Vec<u32>,
 }
@@ -200,6 +203,7 @@ impl FactoryCollector {
             cached_tokens: HashMap::new(),
             cached_child_tokens: HashMap::new(),
             cached_last_call_usage: HashMap::new(),
+            cached_settings_mtimes: HashMap::new(),
             last_droid_pids: Vec::new(),
         }
     }
@@ -231,7 +235,13 @@ impl FactoryCollector {
             self.cached_models = read_models(&self.root);
             self.cached_missions = read_missions(&self.root);
             self.cached_issues = validate_config(&self.root);
-            let (tokens, child_tokens, last_call) = read_session_tokens(&self.root);
+            let files = scan_settings_files(&self.root);
+            self.cached_settings_mtimes = files
+                .iter()
+                .map(|(id, (_, mtime))| (id.clone(), *mtime))
+                .collect();
+            let (tokens, child_tokens, last_call) =
+                read_session_tokens(&files, &self.settings_wanted_ids());
             self.cached_tokens = tokens;
             self.cached_child_tokens = child_tokens;
             self.cached_last_call_usage = last_call;
@@ -249,6 +259,50 @@ impl FactoryCollector {
             })
             .map(|(pid, _)| *pid)
             .collect()
+    }
+
+    /// Freshest liveness timestamp for an entry: the index `mtime` or the
+    /// settings file's filesystem mtime, whichever is newer. The index lags
+    /// behind real activity, so the settings file is authoritative when newer.
+    fn live_mtime(&self, entry: &IndexEntry) -> u64 {
+        let settings_mtime = self
+            .cached_settings_mtimes
+            .get(&entry.session_id)
+            .copied()
+            .unwrap_or(0);
+        entry.mtime_ms().max(settings_mtime)
+    }
+
+    /// Session ids whose `<id>.settings.json` content should be read for token
+    /// data: live sessions plus the parents of live workers (so subagent
+    /// `childInclusiveTokenUsageBySessionId` is available) and the workers of
+    /// live parents. Stale, never-indexed sessions are skipped, keeping the
+    /// slow tick fast — their liveness still comes from
+    /// [`Self::live_mtime`], which only needs the cheap mtime scan.
+    fn settings_wanted_ids(&self) -> std::collections::HashSet<String> {
+        let now = now_ms();
+        let live = |e: &IndexEntry| now.saturating_sub(self.live_mtime(e)) < LIVE_WINDOW_MS;
+        let mut wanted: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for e in &self.cached_index {
+            if live(e) {
+                wanted.insert(e.session_id.clone());
+            }
+        }
+        // Include parents of live workers and workers of live parents so token
+        // breakdowns render correctly for a live mission orchestrator.
+        for e in &self.cached_index {
+            let parent_live = e
+                .calling_session_id
+                .as_deref()
+                .is_some_and(|p| wanted.contains(p));
+            if parent_live || wanted.contains(&e.session_id) {
+                wanted.insert(e.session_id.clone());
+                if let Some(p) = &e.calling_session_id {
+                    wanted.insert(p.clone());
+                }
+            }
+        }
+        wanted
     }
 
     fn build_sessions(&self) -> Vec<AgentSession> {
@@ -276,7 +330,7 @@ impl FactoryCollector {
             .iter()
             .filter(|e| e.calling_session_id.is_none())
             .collect();
-        parents.sort_by_key(|a| std::cmp::Reverse(a.mtime_ms()));
+        parents.sort_by_key(|a| std::cmp::Reverse(self.live_mtime(a)));
         let workers: Vec<&IndexEntry> = self
             .cached_index
             .iter()
@@ -287,17 +341,14 @@ impl FactoryCollector {
         let mut sessions = Vec::new();
 
         for parent in parents {
-            let age = now.saturating_sub(parent.mtime_ms());
-            if age >= LIVE_WINDOW_MS {
-                continue;
-            }
-
             let mut subagents = Vec::new();
+            let mut newest_worker_mtime = 0u64;
             for worker in workers
                 .iter()
                 .filter(|w| w.calling_session_id.as_deref() == Some(parent.session_id.as_str()))
             {
-                let worker_age = now.saturating_sub(worker.mtime_ms());
+                let worker_age = now.saturating_sub(self.live_mtime(worker));
+                newest_worker_mtime = newest_worker_mtime.max(self.live_mtime(worker));
                 if worker_age >= LIVE_WINDOW_MS {
                     continue;
                 }
@@ -313,6 +364,15 @@ impl FactoryCollector {
                         .get(&worker.session_id)
                         .map_or(0, |u| u.total()),
                 });
+            }
+
+            // A parent is live if its own mtime is recent OR any of its workers
+            // are (a mission orchestrator idles between worker turns).
+            let parent_age = now.saturating_sub(self.live_mtime(parent));
+            let live_mtime = self.live_mtime(parent).max(newest_worker_mtime);
+            let age = now.saturating_sub(live_mtime);
+            if parent_age >= LIVE_WINDOW_MS && age >= LIVE_WINDOW_MS {
+                continue;
             }
 
             let model = parent
@@ -354,7 +414,7 @@ impl FactoryCollector {
                 session_id: parent.session_id.clone(),
                 cwd: parent.cwd.clone(),
                 project_name: base_name(&parent.cwd),
-                started_at: parent.mtime_ms(),
+                started_at: self.live_mtime(parent),
                 status: live_status(age),
                 model,
                 effort: String::new(),
@@ -457,28 +517,31 @@ fn read_index(root: &Path) -> Vec<IndexEntry> {
     parsed.entries
 }
 
-/// Recursively scan `sessions/` for `<sessionId>.settings.json` files and parse
-/// token usage. Returns `(own usage by session id, child inclusive usage by
-/// child session id, last call usage by session id)`.
-fn read_session_tokens(
-    root: &Path,
-) -> (
-    HashMap<String, SessionTokenUsage>,
-    HashMap<String, SessionTokenUsage>,
-    HashMap<String, LastCallUsage>,
-) {
-    let mut own = HashMap::new();
-    let mut children = HashMap::new();
-    let mut last_call = HashMap::new();
+/// Collect `<sessionId>.settings.json` mtimes across `sessions/` without
+/// reading file contents. This is the cheap liveness scan; the index's
+/// `mtime` lags behind real activity.
+/// Recursively scan `sessions/` for `<sessionId>.settings.json` files,
+/// returning each file's path and filesystem mtime in a single directory
+/// walk. `DirEntry::file_type()` is used for dir/symlink classification so
+/// no extra per-entry `stat` syscall is issued; the map is shared by the
+/// mtime scan and the token read to avoid walking the tree twice.
+fn scan_settings_files(root: &Path) -> HashMap<String, (PathBuf, u64)> {
+    let mut files = HashMap::new();
     let mut stack = vec![root.join("sessions")];
     while let Some(dir) = stack.pop() {
         let Ok(read_dir) = fs::read_dir(&dir) else {
             continue;
         };
         for entry in read_dir.flatten() {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
             let path = entry.path();
-            if path.is_dir() {
+            if file_type.is_dir() {
                 stack.push(path);
+                continue;
+            }
+            if file_type.is_symlink() {
                 continue;
             }
             let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
@@ -487,27 +550,61 @@ fn read_session_tokens(
             let Some(session_id) = name.strip_suffix(".settings.json") else {
                 continue;
             };
-            if session_id.is_empty() || is_symlink(&path) {
+            if session_id.is_empty() {
                 continue;
             }
-            let v = read_json(&path);
-            if v.is_null() {
+            let Ok(meta) = entry.metadata() else {
                 continue;
-            }
-            if let Some(usage) = parse_token_usage(v.get("tokenUsage")) {
-                own.insert(session_id.to_string(), usage);
-            }
-            if let Some(lc) = parse_last_call_usage(v.get("lastCallTokenUsage")) {
-                last_call.insert(session_id.to_string(), lc);
-            }
-            if let Some(child_usage) = v
-                .get("childInclusiveTokenUsageBySessionId")
-                .and_then(serde_json::Value::as_object)
-            {
-                for (child_id, child_value) in child_usage {
-                    if let Some(usage) = parse_token_usage(Some(child_value)) {
-                        children.insert(child_id.clone(), usage);
-                    }
+            };
+            let Ok(modified) = meta.modified() else {
+                continue;
+            };
+            let Ok(ms) = modified.duration_since(std::time::UNIX_EPOCH) else {
+                continue;
+            };
+            files.insert(session_id.to_string(), (path, ms.as_millis() as u64));
+        }
+    }
+    files
+}
+
+/// Parse token usage from settings files listed in `files`, reading only the
+/// entries whose session id is in `wanted`. Returns `(own usage by session id,
+/// child inclusive usage by child session id, last call usage by session id)`.
+/// The index is the authoritative session list, and workers are always
+/// included so live parents keep their subagent token breakdowns.
+fn read_session_tokens(
+    files: &HashMap<String, (PathBuf, u64)>,
+    wanted: &std::collections::HashSet<String>,
+) -> (
+    HashMap<String, SessionTokenUsage>,
+    HashMap<String, SessionTokenUsage>,
+    HashMap<String, LastCallUsage>,
+) {
+    let mut own = HashMap::new();
+    let mut children = HashMap::new();
+    let mut last_call = HashMap::new();
+    for (session_id, (path, _)) in files {
+        if !wanted.contains(session_id) {
+            continue;
+        }
+        let v = read_json(path);
+        if v.is_null() {
+            continue;
+        }
+        if let Some(usage) = parse_token_usage(v.get("tokenUsage")) {
+            own.insert(session_id.clone(), usage);
+        }
+        if let Some(lc) = parse_last_call_usage(v.get("lastCallTokenUsage")) {
+            last_call.insert(session_id.clone(), lc);
+        }
+        if let Some(child_usage) = v
+            .get("childInclusiveTokenUsageBySessionId")
+            .and_then(serde_json::Value::as_object)
+        {
+            for (child_id, child_value) in child_usage {
+                if let Some(usage) = parse_token_usage(Some(child_value)) {
+                    children.insert(child_id.clone(), usage);
                 }
             }
         }
@@ -521,7 +618,6 @@ fn parse_last_call_usage(v: Option<&serde_json::Value>) -> Option<LastCallUsage>
     let get = |key: &str| obj.get(key).and_then(serde_json::Value::as_u64).unwrap_or(0);
     Some(LastCallUsage {
         input: get("inputTokens"),
-        output: get("outputTokens"),
         cache_read: get("cacheReadTokens"),
     })
 }
@@ -1024,6 +1120,7 @@ mod tests {
             cached_tokens: HashMap::new(),
             cached_child_tokens: HashMap::new(),
             cached_last_call_usage: HashMap::new(),
+            cached_settings_mtimes: HashMap::new(),
             last_droid_pids: Vec::new(),
         }
     }
@@ -1043,6 +1140,56 @@ mod tests {
         assert_eq!(s.subagents.len(), 1);
         assert_eq!(s.subagents[0].name, "Worker: fix x");
         assert_eq!(s.config_root, "~/.factory");
+    }
+
+    #[test]
+    fn build_sessions_keeps_parent_with_live_worker_but_stale_own_mtime() {
+        let root = dirs::home_dir().unwrap().join(".factory");
+        let now = now_ms();
+        let text = r#"{
+          "entries": [
+            {"sessionId":"parent-1","hostId":"h1","mtime":<OLD>,"title":"Orchestrator","cwd":"C:\\project","messagesCount":5},
+            {"sessionId":"worker-1","hostId":"h1","mtime":<RECENT>,"title":"Worker: fix x","cwd":"C:\\project","messagesCount":2,"callingSessionId":"parent-1"},
+            {"sessionId":"worker-stale","hostId":"h1","mtime":<OLD>,"title":"Worker: stale","cwd":"C:\\project","messagesCount":2,"callingSessionId":"parent-1"},
+            {"sessionId":"solo-1","hostId":"h1","mtime":<OLD>,"title":"Solo stale","cwd":"C:\\old","messagesCount":1}
+          ]
+        }"#;
+        let json = text
+            .replace("<OLD>", &format!("{}", now - 20 * 60 * 1000))
+            .replace("<RECENT>", &format!("{}", now - 5000));
+        let mut collector = collector_with(root);
+        collector.cached_index = serde_json::from_str::<IndexRoot>(&json).unwrap().entries;
+
+        let sessions = collector.build_sessions();
+        assert_eq!(sessions.len(), 1, "only parent kept via live worker");
+        let s = &sessions[0];
+        assert_eq!(s.session_id, "parent-1");
+        assert_eq!(s.subagents.len(), 1, "stale worker not attached");
+        assert_eq!(s.subagents[0].name, "Worker: fix x");
+    }
+
+    #[test]
+    fn build_sessions_keeps_session_with_fresh_settings_file_but_stale_index_mtime() {
+        let root = dirs::home_dir().unwrap().join(".factory");
+        let now = now_ms();
+        let text = r#"{
+          "entries": [
+            {"sessionId":"solo-1","hostId":"h1","mtime":<STALE>,"title":"Solo chat","cwd":"C:\\project","messagesCount":5},
+            {"sessionId":"dead-1","hostId":"h1","mtime":<STALE>,"title":"Old","cwd":"C:\\old","messagesCount":1}
+          ]
+        }"#;
+        let json = text.replace("<STALE>", &format!("{}", now - 30 * 60 * 1000));
+        let mut collector = collector_with(root);
+        collector.cached_index = serde_json::from_str::<IndexRoot>(&json).unwrap().entries;
+        // Only solo-1 has a fresh settings file; dead-1 has none.
+        collector
+            .cached_settings_mtimes
+            .insert("solo-1".to_string(), now - 30 * 1000);
+
+        let sessions = collector.build_sessions();
+        assert_eq!(sessions.len(), 1, "solo-1 kept by fresh settings file");
+        assert_eq!(sessions[0].session_id, "solo-1");
+        assert_eq!(sessions[0].status, SessionStatus::Executing);
     }
 
     #[test]
@@ -1116,12 +1263,44 @@ mod tests {
         std::fs::write(sessions.join("notes.txt"), "not json").unwrap();
         std::fs::write(sessions.join("misc.settings.json.bak"), "{").unwrap();
 
-        let (own, children, _last_call) = read_session_tokens(root);
+        let files = scan_settings_files(root);
+        let (own, children, _last_call) = read_session_tokens(
+            &files,
+            &["parent-1".to_string(), "worker-1".to_string()]
+                .into_iter()
+                .collect(),
+        );
         assert_eq!(own.get("parent-1").unwrap().total(), 420);
         assert_eq!(own.get("worker-1").unwrap().total(), 12);
         assert_eq!(children.get("worker-1").unwrap().total(), 42);
         assert!(!children.contains_key("parent-1"));
         assert_eq!(own.len(), 2, "notes.txt and .bak ignored");
+    }
+
+    #[test]
+    fn read_session_tokens_only_reads_wanted_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let sessions = root.join("sessions").join("-C-project-Miros");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(
+            sessions.join("wanted-1.settings.json"),
+            r#"{"tokenUsage": {"inputTokens": 100, "outputTokens": 20}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            sessions.join("skipped-1.settings.json"),
+            r#"{"tokenUsage": {"inputTokens": 999, "outputTokens": 999}}"#,
+        )
+        .unwrap();
+
+        let files = scan_settings_files(root);
+        let (own, _children, _last_call) = read_session_tokens(
+            &files,
+            &["wanted-1".to_string()].into_iter().collect(),
+        );
+        assert_eq!(own.len(), 1, "skipped-1 not read");
+        assert_eq!(own.get("wanted-1").unwrap().total(), 120);
     }
 
     #[test]
